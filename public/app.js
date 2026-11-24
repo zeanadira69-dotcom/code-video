@@ -208,7 +208,7 @@ function refreshAudioNote() {
   if (audio.duration > vd + 0.05) {
     msg = `Audio ${fmtDur(audio.duration)} lebih panjang dari video ${fmtDur(vd)}. Audio akan dipotong.`;
   } else if (audio.duration < vd - 0.05) {
-    msg = `Audio ${fmtDur(audio.duration)} lebih pendek dari video ${fmtDur(vd)}. Aktifkan loop agar audio berulang.`;
+    msg = `Audio ${fmtDur(audio.duration)} lebih pendek dari video ${fmtDur(vd)}. Sisanya hening, atau aktifkan loop agar audio berulang.`;
   } else {
     msg = `Durasi audio dan video sama (${fmtDur(vd)}).`;
   }
@@ -613,6 +613,7 @@ $('render').onclick = async () => {
     toast('Video berhasil dirender', 'success');
   } catch (e) {
     if (started) fetch('/api/abort', { method: 'POST' }).catch(() => {});
+    if (/audio tidak ditemukan/.test(e.message)) { audio = null; renderAudio(); }
     $('ptext').textContent = 'Gagal';
     toast('Render gagal: ' + e.message.slice(-200), 'error');
   } finally {

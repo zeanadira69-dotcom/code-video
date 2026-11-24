@@ -64,8 +64,24 @@ function failSession(msg) {
   saveJobs();
   try { s.ff.stdin.end(); } catch {}
   s.ff.kill('SIGKILL');
-  if (s.audioPath) fs.rm(s.audioPath, () => {});
 }
+
+// Audio sementara dipertahankan agar bisa dipakai untuk beberapa kali render.
+// File audio yang lebih tua dari 24 jam dibersihkan otomatis.
+function cleanTmp(maxAgeMs = 24 * 60 * 60 * 1000) {
+  fs.readdir(TMP, (err, files) => {
+    if (err) return;
+    const now = Date.now();
+    for (const f of files) {
+      if (!/^audio-\d+\./.test(f)) continue;
+      const fp = path.join(TMP, f);
+      fs.stat(fp, (e, st) => {
+        if (!e && now - st.mtimeMs > maxAgeMs) fs.rm(fp, () => {});
+      });
+    }
+  });
+}
+cleanTmp();
 function json(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
@@ -107,7 +123,7 @@ function getProbe(file) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const p = url.pathname;
   if (req.method === 'GET' && p === '/api/config') {
@@ -182,18 +198,25 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && p === '/api/audio') {
     if (session) return json(res, 409, { error: 'render sedang berjalan' });
+    // Client mengirim nama file dalam bentuk encodeURIComponent
+    const rawName = String(req.headers['x-filename'] || '');
+    let fileName;
+    try { fileName = decodeURIComponent(rawName); } catch { fileName = rawName; }
+    fileName = path.basename(fileName);
     const type = req.headers['content-type'] || '';
-    if (!type.startsWith('audio/') && !/\.(mp3|wav|m4a|ogg|aac|flac)$/i.test(req.headers['x-filename'] || '')) {
+    if (!type.startsWith('audio/') && !/\.(mp3|wav|m4a|ogg|aac|flac)$/i.test(fileName)) {
       return json(res, 400, { error: 'file harus berupa audio' });
     }
     if (+req.headers['content-length'] > MAX_AUDIO) return json(res, 400, { error: 'maks 60 MB' });
     const buf = await readBody(req, true, MAX_AUDIO);
-    const ext = (path.extname(req.headers['x-filename'] || '') || '.mp3').toLowerCase().replace(/[^.a-z0-9]/g, '');
+    let ext = path.extname(fileName).toLowerCase().replace(/[^.a-z0-9]/g, '');
+    if (!/^\.[a-z0-9]+$/.test(ext)) ext = '.mp3';
     const id = `audio-${Date.now()}${ext}`;
     fs.writeFileSync(path.join(TMP, id), buf);
     const dur = await getProbe(path.join(TMP, id));
     if (!dur) { fs.rm(path.join(TMP, id), () => {}); return json(res, 400, { error: 'audio tidak bisa dibaca' }); }
-    return json(res, 200, { id, duration: dur, name: req.headers['x-filename'] || id });
+    cleanTmp();
+    return json(res, 200, { id, duration: dur, name: fileName || id });
   }
 
   if (req.method === 'POST' && p === '/api/start') {
@@ -214,12 +237,13 @@ const server = http.createServer(async (req, res) => {
     if (!(duration > 0)) return json(res, 400, { error: 'durasi tidak valid' });
 
     let audioPath = null, audioInfo = null;
-    if (body.audio && body.audio.id && /^audio-\d+\.[a-z0-9]+$/.test(body.audio.id)) {
-      const ap = path.join(TMP, body.audio.id);
-      if (fs.existsSync(ap)) {
-        audioPath = ap;
-        audioInfo = { name: body.audio.name || body.audio.id, loop: !!body.audio.loop };
+    if (body.audio) {
+      const aid = String(body.audio.id || '');
+      if (!/^audio-\d+\.[a-z0-9]+$/.test(aid) || !fs.existsSync(path.join(TMP, aid))) {
+        return json(res, 400, { error: 'audio tidak ditemukan di server, silakan unggah ulang' });
       }
+      audioPath = path.join(TMP, aid);
+      audioInfo = { name: String(body.audio.name || aid), loop: !!body.audio.loop };
     }
 
     const q = QUALITY[body.quality] || QUALITY.medium;
@@ -231,7 +255,10 @@ const server = http.createServer(async (req, res) => {
     if (audioPath) {
       if (audioInfo.loop) args.push('-stream_loop', '-1');
       args.push('-i', audioPath);
-      args.push('-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-b:a', '160k', '-shortest');
+      // apad: audio yang lebih pendek dilanjutkan dengan hening; panjang total
+      // ditentukan oleh -t di bawah. (-shortest memotong video & membuat FFmpeg
+      // berhenti di tengah render.)
+      args.push('-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-b:a', '160k', '-af', 'apad');
     }
     args.push(
       '-c:v', 'libx264', '-preset', q.preset, '-crf', q.crf,
@@ -270,17 +297,32 @@ const server = http.createServer(async (req, res) => {
   }
   
   if (req.method === 'POST' && p === '/api/frame') {
-    if (!session) return json(res, 400, { error: 'belum start' });
+    const s = session;
+    if (!s) return json(res, 400, { error: 'belum start' });
     const buf = await readBody(req, true, 40 * 1024 * 1024);
-    if (buf.length !== session.frameBytes) {
+    if (session !== s) return json(res, 409, { error: 'render sudah berhenti' });
+    if (buf.length !== s.frameBytes) {
       return json(res, 400, { error: `ukuran frame salah: ${buf.length} byte` });
     }
-    session.lastSeen = Date.now();
-    session.job.frames += 1;
-    if (!session.ff.stdin.write(buf)) {
-      await new Promise(r => session.ff.stdin.once('drain', r));
+    const stdin = s.ff.stdin;
+    const ffError = () => json(res, 500, { error: 'FFmpeg berhenti: ' + s.getLog().slice(-200) });
+    if (stdin.destroyed || stdin.writableEnded) return ffError();
+    s.lastSeen = Date.now();
+    s.job.frames += 1;
+    if (!stdin.write(buf)) {
+      // Tunggu drain, tapi jangan menggantung selamanya jika FFmpeg sudah mati
+      const ok = await new Promise(resolve => {
+        const done = v => {
+          stdin.off('drain', onDrain); stdin.off('close', onEnd); stdin.off('error', onEnd);
+          resolve(v);
+        };
+        const onDrain = () => done(true);
+        const onEnd = () => done(false);
+        stdin.once('drain', onDrain); stdin.once('close', onEnd); stdin.once('error', onEnd);
+      });
+      if (!ok) return ffError();
     }
-    return json(res, 200, { ok: true, frames: session.job.frames });
+    return json(res, 200, { ok: true, frames: s.job.frames });
   }
 
   if (req.method === 'POST' && p === '/api/finish') {
@@ -288,8 +330,7 @@ const server = http.createServer(async (req, res) => {
     const s = session;
     session = null;
     s.ff.stdin.end();
-    const code = await new Promise(r => s.ff.on('close', r));
-    if (s.audioPath) fs.rm(s.audioPath, () => {});
+    const code = s.ff.exitCode !== null ? s.ff.exitCode : await new Promise(r => s.ff.once('close', r));
     if (code !== 0) {
       s.job.status = 'error'; s.job.error = s.getLog().slice(-300); s.job.finishedAt = Date.now();
       saveJobs();
@@ -318,6 +359,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   json(res, 404, { error: 'not found' });
+}
+
+const server = http.createServer((req, res) => {
+  handle(req, res).catch(err => {
+    console.error(err);
+    if (!res.headersSent) json(res, 500, { error: err.message || 'kesalahan server' });
+    else res.end();
+  });
 });
 
 server.listen(PORT, () => {
